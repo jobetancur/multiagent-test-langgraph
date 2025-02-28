@@ -7,17 +7,27 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { NodeInterrupt } from "@langchain/langgraph";
 import { StateGraph } from "@langchain/langgraph";
 import { MemorySaver } from "@langchain/langgraph";
-import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
-import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { RunnableConfig } from "@langchain/core/runnables";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
+import { INITIAL_SUPPORT_MESSAGES, BILLING_SUPPORT_MESSAGES, TECHNICAL_SUPPORT_MESSAGES } from "./constants";
+import { categorizeInitialSupport, categorizeBillingResponse } from "./tools";
+import { AgentExecutor, createOpenAIFunctionsAgent } from "langchain/agents";
+
+// Express
+import express from "express";
+import bodyParser from "body-parser";
+import cors from "cors";
+
+// UUID
+import { v4 as uuidv4 } from "uuid";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
+
+const app = express();
+const PORT = 3008;
+
+app.use(cors()); // Permite solicitudes desde otros dominios
+app.use(bodyParser.json());
 
 dotenv.config();
-
-const StateAnnotation = Annotation.Root({
-    ...MessagesAnnotation.spec,
-    nextRepresentative: Annotation<string>,
-    refundAuthorized: Annotation<boolean>,
-  });
 
 const checkpointer = new MemorySaver();
 
@@ -27,308 +37,339 @@ const model = new ChatOpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// 🟢 Agente de Soporte Inicial
-const initialSupportAgent = createReactAgent({
-  llm: model,
-  tools: [],
-  stateModifier: new SystemMessage(
-    `You are frontline support staff for LangCorp, a company that sells computers.
-Be concise in your responses.
-You can chat with customers and help them with basic questions, but if the customer is having a billing or technical problem,
-do not try to answer the question directly or gather information.
-Instead, immediately transfer them to the billing or technical team by asking the user to hold for a moment.
-Otherwise, just respond conversationally. Recuerda que ya has conversado previamente con el usuario y utiliza el historial de mensajes para ofrecer una respuesta coherente y personalizada.`
-  ),
+const StateAnnotation = Annotation.Root({
+  ...MessagesAnnotation.spec,
+  nextRepresentative: Annotation<string>,
+  refundAuthorized: Annotation<boolean>,
 });
 
-// 🟢 Agente de Soporte de Facturación
-const billingSupportAgent = createReactAgent({
-  llm: model,
-  tools: [],
-  stateModifier: new SystemMessage(
-    "You are an expert billing support specialist for LangCorp. " +
-    "You assist users with billing issues and can authorize refunds. " +
-    "If a refund is needed, transfer them to the refund processing agent."
-  ),
-});
+// ✅ Definir el prompt correctamente como `ChatPromptTemplate`
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", `${INITIAL_SUPPORT_MESSAGES.SYSTEM_TEMPLATE}`],
+  ["human", "Tools available: {tool_names}"],
+  ["human", "Previous tool outputs: {agent_scratchpad}"],
+  new MessagesPlaceholder("chat_history"),
+]);
 
-// 🟢 Agente de Soporte Técnico
-const technicalSupportAgent = createReactAgent({
-  llm: model,
-  tools: [],
-  stateModifier: new SystemMessage(
-    "You are an expert at diagnosing technical computer issues for LangCorp. " +
-    "Help the user efficiently and concisely."
-  ),
-});
+// ✅ Resolver la promesa antes de asignar el agente
+const createAgent = async () => {
+  const tools = [categorizeInitialSupport]; // Lista de herramientas disponibles
+  return await createOpenAIFunctionsAgent({
+    llm: model,
+    tools: tools,
+    prompt: prompt, // 🔥 Pasamos `ChatPromptTemplate`, NO un string formateado
+  });
+};
 
-// 🟢 Agente de Procesamiento de Reembolsos
-const refundAgent = createReactAgent({
-  llm: model,
-  tools: [],
-  stateModifier: new SystemMessage(
-    "You handle refund requests. If a refund is authorized, process it immediately."
-  ),
-});
+// ✅ Configurar `AgentExecutor`
+const setupAgentExecutor = async () => {
+  const agent = await createAgent(); // 🔥 Resolver la promesa
+  return new AgentExecutor({
+    agent,
+    tools: [categorizeInitialSupport],
+    verbose: true,
+  });
+};
 
-const initialSupportNode = async (
-    state: typeof StateAnnotation.State,
-    config?: RunnableConfig
-  ) => {
-    // 1. Se invoca al agente de soporte inicial para obtener la respuesta inicial.
-    const SYSTEM_TEMPLATE =
-    `You are frontline support staff for LangCorp, a company that sells computers.
-Be concise in your responses.
-You can chat with customers and help them with basic questions, but if the customer is having a billing or technical problem,
-do not try to answer the question directly or gather information.
-Instead, immediately transfer them to the billing or technical team by asking the user to hold for a moment.
-Otherwise, just respond conversationally. Recuerda que ya has conversado previamente con el usuario y utiliza el historial de mensajes para ofrecer una respuesta coherente y personalizada.`;
+// ✅ Convertir el prompt en un `ChatPromptTemplate`
+const billingPrompt = ChatPromptTemplate.fromMessages([
+  ["system", `${BILLING_SUPPORT_MESSAGES.SYSTEM_TEMPLATE}`],
+  ["human", "Tools available: {tool_names}"],
+  ["human", "Previous tool outputs: {agent_scratchpad}"],
+  new MessagesPlaceholder("chat_history"),
+]);
 
-  // Se obtiene la respuesta del modelo para la interacción de soporte general
-  const supportResponse = await model.invoke([
-    { role: "system", content: SYSTEM_TEMPLATE },
-    ...state.messages,
-  ]);
+// ✅ Crear el agente para `billingSupport`
+const createBillingAgent = async () => {
+  const tools = [categorizeBillingResponse]; // Lista de herramientas disponibles
+  return await createOpenAIFunctionsAgent({
+    llm: model, // Modelo OpenAI
+    tools: tools, // Herramienta de categorización de reembolsos
+    prompt: billingPrompt,
+  });
+};
 
-    // 2. Se define la función de categorización para determinar el enrutamiento.
-    const categorizationFunctions = [
-      {
-        name: "categorize",
-        description:
-          "Determines whether the support representative wants to route the user to billing, technical, or just respond conversationally.",
-        parameters: {
-          type: "object",
-          properties: {
-            nextRepresentative: {
-              type: "string",
-              enum: ["BILLING", "TECHNICAL", "RESPOND"],
-              description:
-                "Indicates the routing decision: 'BILLING' for billing team, 'TECHNICAL' for technical team, or 'RESPOND' for a conversational response.",
-            },
-          },
-          required: ["nextRepresentative"],
-        },
-      },
-    ];
-  
-    const CATEGORIZATION_SYSTEM_TEMPLATE = `You are an expert customer support routing system.
-  Your job is to detect whether a customer support representative is routing a user to a billing team or a technical team, or if they are just responding conversationally. Recuerda que ya has conversado previamente con el usuario y utiliza el historial de mensajes para ofrecer una respuesta coherente y personalizada.`;
-  
-    const CATEGORIZATION_HUMAN_TEMPLATE = `The previous conversation is an interaction between a customer support representative and a user.
-  Extract whether the representative is routing the user to a billing or technical team, or whether they are just responding conversationally.
-  Return your answer as a JSON object with a single key "nextRepresentative" whose value is one of:
-  - "BILLING" (if routing to billing),
-  - "TECHNICAL" (if routing to technical), or
-  - "RESPOND" (if just responding).`;
-  
-    // 3. Se hace el segundo invoke para categorizar la respuesta.
-    const categorizationResponse = await model.invoke(
-      [
-        { role: "system", content: CATEGORIZATION_SYSTEM_TEMPLATE },
-        ...state.messages,
-        { role: "user", content: CATEGORIZATION_HUMAN_TEMPLATE },
-      ],
-      {
-        functions: categorizationFunctions,
-        function_call: "auto",
-      }
-    );
-  
-    let categorizationOutput;
-    if (
-      categorizationResponse.additional_kwargs &&
-      categorizationResponse.additional_kwargs.function_call
-    ) {
-      const functionCall = categorizationResponse.additional_kwargs.function_call;
-      categorizationOutput = JSON.parse(functionCall.arguments);
-    } else {
-      categorizationOutput = JSON.parse(categorizationResponse.content as string);
-    }
-  
-    // 4. Se retorna el estado actualizado, incluyendo la decisión de enrutamiento.
-    return {
-      messages: state.messages,
-      nextRepresentative: categorizationOutput.nextRepresentative,
-    };
+// ✅ Configurar `AgentExecutor` para facturación
+const setupBillingAgentExecutor = async () => {
+  const agent = await createBillingAgent(); // 🔥 Resolver promesa
+  return new AgentExecutor({
+    agent,
+    tools: [categorizeBillingResponse], // Pasamos la herramienta
+    verbose: true,
+  });
+};
+
+// ✅ Convertir el prompt en un `ChatPromptTemplate`
+const technicalPrompt = ChatPromptTemplate.fromMessages([
+  ["system", `${TECHNICAL_SUPPORT_MESSAGES.SYSTEM_TEMPLATE}`],
+  ["human", "Tools available: {tool_names}"],
+  ["human", "Previous tool outputs: {agent_scratchpad}"],
+  new MessagesPlaceholder("chat_history"),
+]);
+
+// ✅ Crear el agente para `technicalSupport`
+const createTechnicalAgent = async () => {
+  const tools: never[] = []; // No necesita herramientas
+  return await createOpenAIFunctionsAgent({
+    llm: model, // Modelo OpenAI
+    tools: tools, // No necesita herramientas
+    prompt: technicalPrompt,
+  });
+};
+
+// ✅ Configurar `AgentExecutor` para soporte técnico
+const setupTechnicalAgentExecutor = async () => {
+  const agent = await createTechnicalAgent(); // 🔥 Resolver promesa
+  return new AgentExecutor({
+    agent,
+    tools: [], // No hay herramientas en este caso
+    verbose: true,
+  });
+};
+
+// 🔄 Actualizar el `initialSupport` para usar el nuevo `AgentExecutor`
+const initialSupport = async (state: typeof StateAnnotation.State) => {
+  let trimmedHistory = state.messages;
+  if (trimmedHistory.length > 0 && trimmedHistory.at(-1)?._getType() === "ai") {
+    trimmedHistory = trimmedHistory.slice(0, -1);
+  }
+
+  // ⚡ Esperar a que el AgentExecutor esté listo
+  const agentExecutor = await setupAgentExecutor();
+
+  // 🔄 Ejecutar el agente con el historial de mensajes
+  const conversationHistory = trimmedHistory.map((msg) => msg.content).join("\n");
+  const supportResponse = await agentExecutor.call({
+    input: trimmedHistory.map((msg) => msg.content).join("\n"),
+    tool_names: "categorizeInitialSupport", // O los nombres de tus herramientas, según corresponda
+    agent_scratchpad: "",
+    chat_history: conversationHistory,
+  });
+
+  // Extraer el resultado estructurado
+  let categorizationOutput;
+  try {
+    categorizationOutput = JSON.parse(supportResponse.output);
+  } catch (error) {
+    categorizationOutput = { nextRepresentative: "RESPOND" }; // Default en caso de error
+  }
+
+  return {
+    messages: [...state.messages, { role: "assistant", content: supportResponse.output }],
+    nextRepresentative: categorizationOutput.nextRepresentative,
   };
-  
-  // Nodo para el soporte de facturación
-  const billingSupportNode = async (
-    state: typeof StateAnnotation.State,
-    config?: RunnableConfig
-  ) => {
-    // 1. Invocar al agente de facturación.
-    const supportResult = await billingSupportAgent.invoke(state, config);
-    // Para este nodo se puede recortar el historial si el último mensaje es de AI.
-    let trimmedHistory = state.messages;
-    if (trimmedHistory.at(-1)._getType() === "ai") {
-      trimmedHistory = trimmedHistory.slice(0, -1);
-    }
-    // Se añade el último mensaje obtenido.
-    const newMessages = [
-      ...state.messages,
-      supportResult.messages[supportResult.messages.length - 1],
-    ];
-  
-    // 2. Definir la función de categorización para facturación.
-    const categorizationFunctions = [
-      {
-        name: "categorizeBilling",
-        description:
-          "Determines whether the billing support representative wants to refund the user or just respond normally.",
-        parameters: {
-          type: "object",
-          properties: {
-            nextRepresentative: {
-              type: "string",
-              enum: ["REFUND", "RESPOND"],
-              description:
-                "Indicates if the representative wants to refund the user (REFUND) or just respond (RESPOND).",
-            },
-          },
-          required: ["nextRepresentative"],
-        },
-      },
-    ];
-  
-    const CATEGORIZATION_SYSTEM_TEMPLATE = `Your job is to detect whether a billing support representative wants to refund the user.`;
-  
-    const CATEGORIZATION_HUMAN_TEMPLATE = `The following text is a response from a customer support representative.
-  Extract whether they want to refund the user or not.
-  Return your answer as a JSON object with a single key "nextRepresentative" whose value is:
-  - "REFUND" if they want to refund the user,
-  - "RESPOND" if they do not want to refund the user.
-  
-  Here is the text:
-  
-  <text>
-  ${supportResult.messages[supportResult.messages.length - 1].content}
-  </text>.`;
-  
-    // 3. Invocar al modelo para categorizar la respuesta de facturación.
-    const categorizationResponse = await model.invoke(
-      [
-        { role: "system", content: CATEGORIZATION_SYSTEM_TEMPLATE },
-        { role: "user", content: CATEGORIZATION_HUMAN_TEMPLATE },
-      ],
-      {
-        functions: categorizationFunctions,
-        function_call: "auto",
-      }
-    );
-  
-    let categorizationOutput;
-    if (
-      categorizationResponse.additional_kwargs &&
-      categorizationResponse.additional_kwargs.function_call
-    ) {
-      const functionCall = categorizationResponse.additional_kwargs.function_call;
-      categorizationOutput = JSON.parse(functionCall.arguments);
-    } else {
-      categorizationOutput = JSON.parse(categorizationResponse.content as string);
-    }
-  
-    // 4. Retornar el estado actualizado, incluyendo la decisión para facturación.
-    return {
-      messages: newMessages,
-      nextRepresentative: categorizationOutput.nextRepresentative,
-    };
+};
+
+
+// 🔄 `billingSupport` con el nuevo enfoque
+const billingSupport = async (state: typeof StateAnnotation.State) => {
+  let trimmedHistory = state.messages;
+  if (trimmedHistory.length > 0 && trimmedHistory.at(-1)?._getType() === "ai") {
+    trimmedHistory = trimmedHistory.slice(0, -1);
+  }
+
+  // ⚡ Esperar a que `AgentExecutor` esté listo
+  const agentExecutor = await setupBillingAgentExecutor();
+
+  // 🔄 Ejecutar el agente con el historial de mensajes
+  const conversationHistory = trimmedHistory.map((msg) => msg.content).join("\n");
+  const billingRepResponse = await agentExecutor.call({
+    input: trimmedHistory.map((msg) => msg.content).join("\n"),
+    tool_names: "categorizeBillingResponse", // O los nombres de tus herramientas, según corresponda
+    agent_scratchpad: "",
+    chat_history: conversationHistory
+  });
+
+  // Extraer la decisión de categorización
+  let categorizationOutput;
+  try {
+    categorizationOutput = JSON.parse(billingRepResponse.output);
+  } catch (error) {
+    categorizationOutput = { nextRepresentative: "RESPOND" }; // Default en caso de error
+  }
+
+  return {
+    messages: [...state.messages, { role: "assistant", content: billingRepResponse.output }],
+    nextRepresentative: categorizationOutput.nextRepresentative,
   };
-  
-  // Nodo para el soporte técnico (no requiere categorización adicional)
-  const technicalSupportNode = async (
-    state: typeof StateAnnotation.State,
-    config?: RunnableConfig
-  ) => {
-    const result = await technicalSupportAgent.invoke(state, config);
-    return {
-      messages: [...state.messages, result.messages[result.messages.length - 1]],
-    };
+};
+
+// 🔄 `technicalSupport` con el nuevo enfoque
+const technicalSupport = async (state: typeof StateAnnotation.State) => {
+  let trimmedHistory = state.messages;
+  if (trimmedHistory.length > 0 && trimmedHistory.at(-1)?._getType() === "ai") {
+    trimmedHistory = trimmedHistory.slice(0, -1);
+  }
+
+  // ⚡ Esperar a que `AgentExecutor` esté listo
+  const agentExecutor = await setupTechnicalAgentExecutor();
+
+  // 🔄 Ejecutar el agente con el historial de mensajes
+  const conversationHistory = trimmedHistory.map((msg) => msg.content).join("\n");
+  const technicalRepResponse = await agentExecutor.call({
+    input: trimmedHistory.map((msg) => msg.content).join("\n"),
+    tool_names: "", // No necesita herramientas
+    agent_scratchpad: "",
+    chat_history: conversationHistory
+  });
+
+  return {
+    messages: [...state.messages, { role: "assistant", content: technicalRepResponse.output }],
   };
-  
-let workflow = new StateGraph(StateAnnotation)
-  .addNode("initial_support", initialSupportNode)
-  .addNode("billing_support", billingSupportNode)
-  .addNode("technical_support", technicalSupportNode)
+};
+
+const handleRefund = async (state: typeof StateAnnotation.State) => {
+  if (!state.refundAuthorized) {
+    console.log("--- HUMAN AUTHORIZATION REQUIRED FOR REFUND ---");
+    throw new NodeInterrupt("Human authorization required.");
+  }
+  return {
+    messages: {
+      role: "assistant",
+      content: "Refund processed!",
+    },
+  };
+};
+
+let builder = new StateGraph(StateAnnotation)
+  .addNode("initial_support", initialSupport)
+  .addNode("billing_support", billingSupport)
+  .addNode("technical_support", technicalSupport)
+  .addNode("fallback", async (state) => {
+    return { messages: [...state.messages, { role: "assistant", content: "Lo siento, no pude clasificar tu solicitud." }] };
+  })
   .addEdge("__start__", "initial_support");
 
-// 📌 Definir las transiciones
-workflow = workflow.addConditionalEdges(
+builder = builder.addConditionalEdges(
   "initial_support",
   async (state: typeof StateAnnotation.State) => {
-    if (state.nextRepresentative.includes("BILLING")) {
-      return "billing";
-    } else if (state.nextRepresentative.includes("TECHNICAL")) {
-      return "technical";
-    } else {
-      return "conversational";
-    }
+    const rep = state.nextRepresentative || "";
+    if (rep.includes("BILLING")) return "billing";
+    if (rep.includes("TECHNICAL")) return "technical";
+    if (rep.includes("RESPOND")) return "conversational";
+    return "fallback"; // Fallback si el modelo no devuelve un valor esperado
   },
   {
     billing: "billing_support",
     technical: "technical_support",
     conversational: "__end__",
+    fallback: "fallback",
   }
 );
 
-// 📌 Agregar transiciones para los otros agentes
-workflow = workflow
-    .addEdge("technical_support", "__end__")
-    .addEdge("billing_support", "__end__");
+console.log("Added edges!");
+
+builder = builder
+  .addEdge("technical_support", "__end__")
+  .addEdge("billing_support", "__end__");
 
 console.log("Added edges!");
 
-// 📌 Compilar el workflow
-const graph = workflow.compile({ checkpointer });
+const graph = builder.compile({ 
+  checkpointer,
+});
 
-const conversationalStream = await graph.stream({
-    messages: [{
-      role: "user",
-      content: "Hola, necesito ayuda con mi computadora."
-    }]
-  }, {
-    configurable: { thread_id: "conversational_testing_id" }
-  });
-  
-  for await (const value of conversationalStream) {
-    console.log("---STEP---CONVERSATIONAL---");
-    console.log(value);
-    console.log("---END STEP---CONVERSATIONAL---");
+// const conversationalStream = await graph.stream({
+//   messages: [{
+//     role: "user",
+//     content: "Cómo estas? Mi nombre es Alejandro."
+//   }]
+// }, {
+//   configurable: {
+//     thread_id: "conversational_testing_id"
+//   }
+// });
+
+// for await (const value of conversationalStream) {
+//   console.log("---STEP---CONVERSATIONAL---");
+//   console.log(value);
+//   console.log("---END STEP---CONVERSATIONAL---");
+// }
+// console.log("Memoria #1:", checkpointer);
+
+// const newConversationalStream = await graph.stream({
+//   messages: [{
+//     role: "user",
+//     content: "¿Recuerdas mi nombre y la última vez que hablamos?"
+//   }]
+// }, {
+//   configurable: {
+//     thread_id: "conversational_testing_id"
+//   }
+// });
+
+// for await (const value of newConversationalStream) {
+//   console.log("---STEP---CONVERSATIONAL2---");
+//   console.log(value);
+//   console.log("---END STEP---CONVERSATIONAL2---");
+// }
+
+// console.log("Memoria #2:", checkpointer);
+
+// const stream = await graph.stream(
+//   {
+//     messages: [{ role: "user", content: "Hola, ¿cómo estás?" }],
+//   },
+//   {
+//     configurable: { thread_id: "refund_testing_id" },
+//   }
+// );
+
+// const responses = [];
+// for await (const value of stream) {
+//   responses.push(value);
+// }
+
+// // Buscar el nodo que tiene mensajes
+// let agentResponse = null;
+// for (const node of responses) {
+//   const nodeKey = Object.keys(node)[0]; // Ejemplo: "initial_support"
+//   const nodeValue = node[nodeKey];
+
+//   if (nodeValue?.messages?.[0]?.content) {
+//     agentResponse = nodeValue.messages[0].content; // Extraer el content
+//     break; // Salir del bucle cuando se encuentra el primer mensaje válido
+//   }
+// }
+
+// // Si no se encontró ninguna respuesta válida
+// agentResponse = agentResponse || "No response from any agent";
+
+// console.log("Agent response:", agentResponse);
+
+
+// Endpoint para procesar mensajes
+app.post("/api/chat", async (req, res) => {
+  try {
+    
+    const { message, sessionId } = req.body;
+    const threadId = sessionId;
+
+    console.log("Processing message:", message);
+
+    const agentOutput = await graph.invoke(
+      {
+        messages: [{ role: "user", content: message }],
+      },
+      {
+        configurable: { thread_id: threadId },
+      }
+    );
+
+    console.log("Agent output:", agentOutput);
+
+    // Devuelve la respuesta procesada
+    res.json({ 
+      message: agentOutput.messages[agentOutput.messages.length - 1].content,
+      threadId,
+     });
+  } catch (error) {
+    console.error("Error processing message:", error);
+    res.status(500).json({ error: "Internal server error." });
   }
-//   console.log("Memoria #1:", checkpointer);
+});
 
-  const conversationalStream2 = await graph.stream({
-    messages: [{
-      role: "user",
-      content: "Cómo estas? Mi nombre es Alejandro."
-    }]
-  }, {
-    configurable: {
-      thread_id: "conversational_testing_id"
-    }
-  });
-
-  for await (const value of conversationalStream2) {
-    console.log("---STEP---CONVERSATIONAL---");
-    console.log(value);
-    console.log("---END STEP---CONVERSATIONAL---");
-  }
-//   console.log("Memoria #2:", checkpointer);
-
-  const conversationalStream3 = await graph.stream({
-    messages: [{
-        role: "user",
-        content: "¿Recuerdas mi nombre y la última vez que hablamos?"
-        }]
-    }, {
-        configurable: {
-        thread_id: "conversational_testing_id"
-        }
-    });
-
-    for await (const value of conversationalStream3) {
-        console.log("---STEP---CONVERSATIONAL---");
-        console.log(value);
-        console.log("---END STEP---CONVERSATIONAL---");
-    }
-    // console.log("Memoria #3:", checkpointer);
+// Inicia el servidor
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
